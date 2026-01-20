@@ -1,0 +1,417 @@
+# Imports
+install.packages("hardhat")
+install.packages("workflows")
+install.packages("vip")
+install.packages("dials")
+install.packages("readr")
+install.packages("finetune")
+install.packages("glmnet")
+install.packages("tune")
+install.packages("tidymodels")
+install.packages("bestNormalize")
+install.packages("workflowsets")
+install.packages("tidyverse")
+
+library(tune)
+library(workflowsets)
+library(bestNormalize)
+library(tidyverse)
+library(dplyr)
+library(rsample)
+library(tidymodels)
+library(lubridate)
+library(caret)
+library(workflows)
+library(glmnet)
+library(finetune)
+library(dials)
+library(readr)
+library(vip)
+library(stacks)
+library(broom)
+library(tidyr)
+
+
+# Read the CSV file
+rental <- read_csv("C:/Users/Anthony Ebuboh/Downloads/predict movie rental duration/predict movie rental duration/rental_info.csv")
+
+# View structure of dataset
+str(rental)
+unique(rental$special_features)
+
+# Check for missing values
+sapply(rental, function(x) sum(is.na(x)))
+
+## Get the response variable from your data and add new variables
+rental$rent_hours <- difftime(rental$return_date,
+           rental$rental_date,
+           units = "hours") # rent_hours variable
+
+# Rent day of the week
+rental$rent_dow <- as.factor(weekdays(rental$rental_date))
+
+# Rent month of the year
+rental$rent_month <- as.factor( format(rental$rental_date, "%m"))
+
+# Target variable rent_length
+rental$rent_length <- round(as.numeric(rental$rent_hours / 24), 2)
+
+# Convert rent_hours to numeric
+rental$rent_hours <- as.numeric(rental$rent_hours)
+
+rental <- rental %>%
+  arrange(rental_date) %>%
+  mutate(
+    avg_rent_before = lag(cummean(rent_hours))
+  )
+
+
+
+
+str(rental)
+
+# deleted_scenes variable
+rental$deleted_scenes = as.numeric(grepl("Deleted Scenes", rental$special_features))
+
+# behind_the_scenes variable
+rental$behind_the_scenes = as.numeric(grepl("Behind the Scenes", rental$special_features))
+
+# Perform train-test split
+set.seed(85)
+splits <- initial_split(rental, prop = 0.8)
+train <- training(splits)
+test <- testing(splits)
+
+# Check for correlation in the predictor variable
+cor_matrix <- train %>%
+  select_if(is.numeric) %>%
+  select(-rent_length) %>%
+  cor()
+cor_matrix
+
+rec <- recipe(rent_length ~ ., data = train) %>%
+    update_role(rental_date, return_date, special_features, new_role = "ID") %>%
+    step_rm(has_role("ID")) %>%
+    step_rm(rent_hours) %>% # to avoid leak since target variable was computed using rent_hours
+    step_nzv(all_predictors()) %>%
+    step_impute_mean(avg_rent_before) %>%    # replace NAs due to lag() used when creating the variable with the training-set mean
+    step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+    step_corr(all_numeric(), -all_outcomes(), threshold = 0.9) %>%
+    step_normalize(all_numeric(), -all_outcomes())
+rec
+
+# train with prep() and apply with bake() to know how many predictors remaining
+rec_prep <- prep(rec, training = train)
+
+# Bake it to get the processed training tibble
+train_baked <- bake(rec_prep, new_data = NULL)
+
+# View its dimensions
+dim(train_baked)
+
+#  Compute maximum mtry parameter programmatically
+max_mtry <- ncol(train_baked) - 1
+max_mtry
+
+
+# Predictor Importance
+spec <- rand_forest ()%>%
+  set_mode("regression")%>%
+  set_engine("ranger", importance = "impurity")
+
+# fit on train
+model_1 <- spec %>%
+  fit(rent_length ~ ., data = train)
+# View variable Importance
+vip::vip(model_1)
+
+
+# Model specification
+model_spec <- rand_forest(
+  mtry = tune(),
+  trees = tune(),
+  min_n = tune())%>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+model_spec
+
+rf_grid <- grid_random(
+  mtry(range = c(1, max_mtry)),
+  trees(range = c(300, 1000)),
+  min_n(range = c(1, 50)),
+  size = 20
+)
+
+set.seed(123)
+cv_splits <- vfold_cv(train, v = 5)
+
+rf_workflow <- workflow()%>%
+  add_model(model_spec)%>%
+  add_recipe(rec)
+
+# Create a stack_control object for stacking models
+ctrl <- control_stack_grid()
+
+# Tune 
+set.seed(87)
+rf_tune <- rf_workflow %>%
+  tune_grid(
+    resamples = cv_splits,
+    grid = rf_grid,
+    metrics = metric_set(rmse),
+    control = ctrl)
+
+
+
+# Plot model performance
+autoplot(rf_tune, metric = "rmse")
+
+
+best_rf <- rf_tune %>%
+  select_best(metric = "rmse")
+best_rf
+
+# Finalize Workflow
+final_workflow <- rf_workflow %>%
+  finalize_workflow(best_rf)
+
+
+rf_final_model <- last_fit(final_workflow, split = splits,
+                   metrics = metric_set(rmse, rsq))
+
+
+
+collect_metrics(rf_final_model)
+
+predict <- collect_predictions(rf_final_model)
+predict
+
+
+# Calculate MSE
+mse_val <- mean((predict$.pred - predict$rent_length)^2)
+mse_val
+min(predict$rent_length)
+max(predict$rent_length)
+
+
+## Using xgboost
+# Define the XGBoost model specification
+xgb_spec <- boost_tree(
+  mode = "regression",
+  trees = tune(),
+  mtry = tune(),
+  min_n = tune(),
+  learn_rate = tune(), 
+  tree_depth = tune(),
+  sample_size = tune(),
+) %>% 
+  set_engine("xgboost",  early_stopping_rounds = 50 )
+
+# Define the grid for hyperparameter tuning
+xgb_grid <- grid_random(
+  trees(range = c(500, 2000)),
+  mtry(range = c(3, max_mtry)),
+  min_n(range = c(1, 50)),
+  learn_rate(range = c(0.001, 0.3)),
+  tree_depth(range = c(3, 10)),
+  sample_prop(range = c(0.5, 1)),
+  size = 30
+)
+
+# Define the workflow to use the XGBoost model and recipe
+xgb_workflow <- workflow() %>%
+  add_model(xgb_spec) %>%
+  add_recipe(rec)
+
+# Tune the XGBoost model with cross-validation
+set.seed(75)
+xgb_tune <- xgb_workflow %>%
+  tune_grid(
+    resamples = cv_splits,
+    grid = xgb_grid,
+    metrics = metric_set(rmse),
+    control = ctrl)
+
+
+# Plot the RMSE performance
+autoplot(xgb_tune, metric = "rmse")
+
+# Get the best model based on RMSE
+best_xgb <- xgb_tune %>%
+  select_best(metric = "rmse")
+
+# Finalize the workflow with the best model hyperparameters
+final_xgb_workflow <- xgb_workflow %>%
+  finalize_workflow(best_xgb)
+
+# Fit the final model using the entire training data
+xgb_final_model <- last_fit(final_xgb_workflow, split = splits, 
+                            metrics = metric_set(rmse, rsq))
+
+# Collect model metrics
+collect_metrics(xgb_final_model)
+
+# Collect predictions
+predictions <- collect_predictions(xgb_final_model)
+predictions
+
+# Calculate MSE
+mse_xgb <- mean((predictions$.pred - predictions$rent_length)^2)
+mse_xgb
+
+
+## Stacking the models
+# Create a data stack
+ensemble_reg <- stacks() %>%
+  add_candidates(rf_tune) %>%
+  add_candidates(xgb_tune)
+
+# Blend predictions first (without model specification)
+ensemble_reg <- ensemble_reg %>%
+  blend_predictions(penalty = 10^seq(-3, 0, length = 10)) 
+
+# Explicitly use linear regression as the meta-learner
+stack_reg <- ensemble_reg %>%
+  fit_members()
+
+# Visualise model contributions to see the influence of each base model on the final 
+# predictions
+autoplot(stack_reg)
+
+# See the model contributions or weights in the stacking
+print(stack_reg)
+
+
+# Predict
+stacked_pre <- test %>%
+  mutate(.pred = predict(stack_reg, new_data = test)$.pred)
+stacked_pre
+
+# Find RMSE
+stack_metrics <- stacked_pre %>%
+  rmse(truth=rent_length, estimate=.pred)
+stack_metrics
+
+# Find MSE
+stack_mse <- mean((stacked_pre$rent_length - stacked_pre$.pred)^2)
+stack_mse
+
+# Prepare a summary tibble of your three models’ metrics
+metrics_df <- tibble(
+  model = c("Random Forest", "XGBoost", "Stacked Ensemble"),
+  RMSE  = c(1.41,          1.48,       1.36),
+  MSE   = c(1.97,          2.18,       1.85)
+)
+metrics_df
+
+# RMSE Comparison Bar Plot
+rmse_plot <- ggplot(metrics_df, aes(x = model, y = RMSE, fill = model)) +
+  geom_col(show.legend = FALSE) +
+  labs(
+    title = "RMSE Comparison Across Models",
+    x     = "Model",
+    y     = "RMSE"
+  ) +
+  theme_minimal()
+rmse_plot
+
+# MSE Comparison Bar Plot
+mse_plot <- ggplot(metrics_df, aes(x = model, y = MSE, fill = model)) +
+  geom_col(show.legend = FALSE) +
+  labs(
+    title = "MSE Comparison Across Models",
+    x     = "Model",
+    y     = "MSE"
+  ) +
+  theme_minimal()
+mse_plot
+
+# Put all predictions in one dataframe
+test_predictions <- test %>%
+  mutate(
+    rf_pred = predict$.pred,
+    xgb_pred = predictions$.pred,
+    stacked_pred = stacked_pre$.pred
+  )
+colnames(test_predictions)
+
+
+# Visually compare how the different models' predictions align with the actual rent length
+pred_vs_actual <- ggplot(test_predictions, aes(x = rent_length)) +
+  geom_abline(slope = 1, intercept = 0,
+              color = "black",
+              linetype = "dashed",
+              linewidth = 0.8) +
+  geom_point(aes(y = rf_pred, color = "Random Forest"), alpha = 0.5) +
+  geom_point(aes(y = xgb_pred, color = "XGBoost"), alpha = 0.5) +
+  geom_point(aes(y = stacked_pred, color = "Stacked Model"), alpha = 0.5) +
+  labs(title = "Model Predictions vs Actual Values", x = "Actual Rent Length", y = "Predicted Rent Length") +
+  scale_color_manual(values = c("Random Forest" = "red", "XGBoost" = "blue", "Stacked Model" = "green")) +
+  theme_minimal()
+pred_vs_actual
+# All three sets of points trend upward, showing each model generally captures the positive relationship between actual and predicted rent length.
+#	The stacked ensemble’s (green) points lie closest to the 45-degree line (where prediction equals reality), indicating it has the lowest overall bias and tighter spread.
+
+
+#  Prepare a long‐format data frame with predictions and residuals
+df_long <- test_predictions %>%
+  pivot_longer(
+    cols      = c(rf_pred, xgb_pred, stacked_pred),
+    names_to  = "model",
+    values_to = "predicted") %>%
+  mutate(
+    model = recode(model,
+              rf_pred = "Random Forest",
+              xgb_pred = "XGBoost",
+              stacked_pred = "Stacked Ensemble"),
+    residual = rent_length - predicted
+)
+
+#  Residuals vs. Predicted plot
+resid_plot <- ggplot(df_long, aes(x = predicted, y = residual)) +
+  geom_point(alpha = 0.5) +
+  facet_wrap(~ model, scales = "free_x") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Residuals vs. Predicted Rent Length",
+    x     = "Predicted Rent Length (days)",
+    y     = "Residual (Actual − Predicted)"
+  ) +
+  theme_minimal()
+resid_plot
+
+
+
+
+
+
+
+
+    
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
